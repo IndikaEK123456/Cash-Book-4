@@ -1,0 +1,5 @@
+{
+  "name": "Shivas Beach Cabanas Cash Book",
+  "description": "A high-performance, real-time sync cash book application with separate master (laptop) and viewer (mobile) versions for managing resort finances.",
+  "requestFramePermissions": []
+}

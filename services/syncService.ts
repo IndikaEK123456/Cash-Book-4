@@ -2,73 +2,62 @@
 import { SyncData, CashBookState } from '../types';
 
 /**
- * SHIVAS LIVE CLOUD RELAY
- * This service enables true cross-device synchronization using a shared Cloud ID.
- * Laptop pushes state to the cloud, Mobiles poll the cloud for updates.
+ * SHIVAS CLOUD RELAY SERVICE
+ * Uses a public, CORS-enabled JSON store for true cross-device synchronization.
  */
 
-// Unique ID for Shivas Beach Cabanas to prevent data clashing with other apps
-const APP_CLOUD_ID = 'shivas_beach_cabanas_v5_live_relay';
-const STORAGE_KEY = 'shivas_cashbook_local_backup';
-const HISTORY_KEY = 'shivas_cashbook_history';
+const PANTRY_ID = '9416809c-3430-4e33-9115-46f059f1f008'; // Shared unique pantry ID
+const BASKET_NAME = 'shivas_beach_sync';
+const CLOUD_URL = `https://getpantry.cloud/apiv1/pantry/${PANTRY_ID}/basket/${BASKET_NAME}`;
 
-/**
- * We use a public, zero-config key-value store (kvstore.io or similar logic) 
- * to act as the central brain.
- */
-const CLOUD_API_URL = `https://kvstore.io/api/v1/shivas_beach/${APP_CLOUD_ID}`;
+const STORAGE_KEY = 'shivas_local_cache';
+const HISTORY_KEY = 'shivas_history';
 
 export const saveState = async (state: CashBookState) => {
+  if (!state) return;
+  
   const data: SyncData = {
     state,
     updatedAt: Date.now(),
   };
 
-  // 1. Save locally for instant UI feedback and offline backup
+  // 1. Update Local Cache
   localStorage.setItem(STORAGE_KEY, JSON.stringify(data));
 
-  // 2. Push to Cloud Relay (only for Laptop)
+  // 2. Push to Cloud (Laptop only sends)
   try {
-    await fetch(CLOUD_API_URL, {
+    await fetch(CLOUD_URL, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(data),
+      body: JSON.stringify(data.state), // Pantry stores the object directly
     });
   } catch (e) {
-    console.error("Cloud Push Failed - Check Internet Connection", e);
+    console.error("Cloud Push Failed:", e);
   }
 };
 
 export const getState = async (): Promise<CashBookState | null> => {
-  // 1. Try fetching from Cloud Relay first (True Live Connection)
   try {
-    const response = await fetch(CLOUD_API_URL);
+    const response = await fetch(CLOUD_URL);
     if (response.ok) {
-      const data: SyncData = await response.json();
-      // Update local storage so we have it if cloud goes down
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(data));
-      return data.state;
+      const cloudState: any = await response.json();
+      // Basic validation to ensure it looks like our state
+      if (cloudState && (cloudState.outPartyEntries || cloudState.mainEntries)) {
+        return cloudState as CashBookState;
+      }
     }
   } catch (e) {
-    console.warn("Cloud Fetch Failed - Using Local Cache", e);
+    console.warn("Cloud Sync Unavailable - Checking Local Cache");
   }
 
-  // 2. Fallback to local cache if offline
   const local = localStorage.getItem(STORAGE_KEY);
   if (!local) return null;
   try {
-    return JSON.parse(local).state;
+    const parsed = JSON.parse(local);
+    return parsed.state || null;
   } catch (e) {
     return null;
   }
-};
-
-/**
- * Reconnect & Sync Listener
- * Triggers a callback whenever state changes (handled in App.tsx via polling)
- */
-export const onSyncUpdate = (callback: (state: CashBookState) => void) => {
-  // We use the Polling mechanism in App.tsx for true cross-device 'Live' feel
 };
 
 export const saveToHistory = (record: { date: string; data: CashBookState }) => {
@@ -79,5 +68,10 @@ export const saveToHistory = (record: { date: string; data: CashBookState }) => 
 
 export const getHistory = (): { date: string; data: CashBookState }[] => {
   const data = localStorage.getItem(HISTORY_KEY);
-  return data ? JSON.parse(data) : [];
+  if (!data) return [];
+  try {
+    return JSON.parse(data);
+  } catch (e) {
+    return [];
+  }
 };

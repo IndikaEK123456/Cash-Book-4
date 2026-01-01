@@ -10,8 +10,8 @@ import {
 } from './types';
 import * as syncService from './services/syncService';
 
-// --- UI Constants ---
-const CURRENCY_SYMBOL = 'Rs.';
+// --- UI Framework ---
+const CURRENCY = 'Rs.';
 
 const Label = ({ children, className = "" }: { children?: React.ReactNode, className?: string }) => (
   <span className={`text-[10px] font-black uppercase tracking-[0.2em] text-slate-500 mb-1.5 block ${className}`}>
@@ -19,24 +19,21 @@ const Label = ({ children, className = "" }: { children?: React.ReactNode, class
   </span>
 );
 
-const SectionContainer = ({ title, children, isLaptop }: { title: string, children?: React.ReactNode, isLaptop: boolean }) => (
-  <div className="bg-white rounded-[2rem] shadow-2xl shadow-slate-200 border border-slate-100 overflow-hidden flex flex-col h-full">
-    <div className="bg-slate-900 px-8 py-5 flex justify-between items-center border-b border-slate-800">
+const Section = ({ title, children, isLaptop }: { title: string, children?: React.ReactNode, isLaptop: boolean }) => (
+  <div className="bg-white rounded-[2rem] shadow-2xl border border-slate-100 flex flex-col h-full overflow-hidden">
+    <div className="bg-slate-900 px-8 py-5 flex justify-between items-center">
       <h2 className="text-[11px] font-black text-white uppercase tracking-[0.4em]">{title}</h2>
       {!isLaptop && (
         <div className="flex items-center gap-2">
           <div className="w-2 h-2 rounded-full bg-blue-500 animate-pulse"></div>
-          <span className="text-blue-400 text-[9px] font-black uppercase tracking-widest">LIVE VIEWER</span>
+          <span className="text-blue-400 text-[9px] font-black uppercase tracking-widest">Live Viewer</span>
         </div>
       )}
     </div>
-    <div className="p-6 md:p-8 flex-1 flex flex-col">
-      {children}
-    </div>
+    <div className="p-6 md:p-10 flex-1">{children}</div>
   </div>
 );
 
-// --- App Root ---
 export default function App() {
   const [device, setDevice] = useState<DeviceType>(DeviceType.LAPTOP);
   const [state, setState] = useState<CashBookState>({
@@ -48,363 +45,328 @@ export default function App() {
   });
   const [showHistory, setShowHistory] = useState(false);
   const [history, setHistory] = useState<HistoryRecord[]>([]);
-  const stateRef = useRef(state); // For polling comparison
+  
+  // Ref to track state for sync comparison
+  const stateJsonRef = useRef(JSON.stringify(state));
 
+  // Device and Connection Setup
   useEffect(() => {
-    stateRef.current = state;
-  }, [state]);
-
-  // 1. Core Device Setup & Cloud Sync Loop
-  useEffect(() => {
-    const setup = () => {
+    const handleDevice = () => {
       const hash = window.location.hash.toLowerCase();
-      const isMob = /Android|iPhone|iPad|Mobile/i.test(navigator.userAgent);
+      const isMobile = /Android|iPhone|iPad|Mobile/i.test(navigator.userAgent);
       if (hash.includes('android')) setDevice(DeviceType.ANDROID);
       else if (hash.includes('iphone')) setDevice(DeviceType.IPHONE);
-      else if (isMob) setDevice(DeviceType.ANDROID);
+      else if (isMobile) setDevice(DeviceType.ANDROID);
       else setDevice(DeviceType.LAPTOP);
     };
 
-    setup();
-    window.addEventListener('hashchange', setup);
+    handleDevice();
+    window.addEventListener('hashchange', handleDevice);
 
-    // LIVE RECONNECT ENGINE (Rule 3)
-    const runSync = async () => {
-      const cloudState = await syncService.getState();
-      if (cloudState && JSON.stringify(cloudState) !== JSON.stringify(stateRef.current)) {
-        setState(cloudState);
+    // Initial Fetch
+    syncService.getState().then(s => { 
+      if(s && s.outPartyEntries && s.mainEntries) {
+        setState(s); 
+        stateJsonRef.current = JSON.stringify(s);
       }
-    };
+    });
+    setHistory(syncService.getHistory());
 
-    runSync(); // Immediate sync on open
-    const pollInterval = setInterval(runSync, 2000); // 2-second cloud heartbeat
+    // Rule 3: AGGRESSIVE AUTO-RECONNECT SYNC (Every 1.2 seconds)
+    const syncLoop = setInterval(async () => {
+      const cloud = await syncService.getState();
+      if (cloud && cloud.outPartyEntries && cloud.mainEntries) {
+        const cloudJson = JSON.stringify(cloud);
+        if (cloudJson !== stateJsonRef.current) {
+          setState(cloud);
+          stateJsonRef.current = cloudJson;
+        }
+      }
+    }, 1200);
 
-    // Rates (Rule 12)
+    // Rule 12: Exchange Rates
     const fetchRates = async () => {
       try {
         const res = await fetch('https://api.exchangerate-api.com/v4/latest/USD');
         const data = await res.json();
-        const lkr = data.rates.LKR;
-        const eurLkr = lkr / data.rates.EUR;
-        setState(prev => ({
-          ...prev,
-          exchangeRates: { usd: Math.ceil(lkr), eur: Math.ceil(eurLkr) }
-        }));
+        const usd = Math.ceil(data.rates.LKR);
+        const eur = Math.ceil(data.rates.LKR / data.rates.EUR);
+        setState(prev => {
+          const next = { ...prev, exchangeRates: { usd, eur } };
+          stateJsonRef.current = JSON.stringify(next);
+          return next;
+        });
       } catch (e) {}
     };
     fetchRates();
-    setHistory(syncService.getHistory());
 
     return () => {
-      window.removeEventListener('hashchange', setup);
-      clearInterval(pollInterval);
+      window.removeEventListener('hashchange', handleDevice);
+      clearInterval(syncLoop);
     };
   }, []);
 
   const isLaptop = device === DeviceType.LAPTOP;
 
-  const pushState = useCallback((newState: CashBookState) => {
-    setState(newState);
-    if (isLaptop) {
-      syncService.saveState(newState);
-    }
+  // Master update function (laptop only)
+  const masterUpdate = useCallback((next: CashBookState) => {
+    if (!isLaptop) return;
+    setState(next);
+    stateJsonRef.current = JSON.stringify(next);
+    syncService.saveState(next);
   }, [isLaptop]);
 
-  // --- Financial Rules (7, 13, 14, 15, 16) ---
-  const calc = useMemo(() => {
-    const op = state.outPartyEntries.reduce((acc, curr) => {
-      if (curr.method === PaymentMethod.CASH) acc.cash += curr.amount;
-      if (curr.method === PaymentMethod.CARD) acc.card += curr.amount;
-      if (curr.method === PaymentMethod.PAYPAL) acc.paypal += curr.amount;
+  // --- Calculation Engine (Rules 13, 14, 15, 16) ---
+  const totals = useMemo(() => {
+    const outPartyEntries = state.outPartyEntries || [];
+    const mainEntries = state.mainEntries || [];
+
+    // Out Party Totals
+    const op = outPartyEntries.reduce((acc, curr) => {
+      const amt = curr.amount || 0;
+      if (curr.method === PaymentMethod.CASH) acc.cash += amt;
+      if (curr.method === PaymentMethod.CARD) acc.card += amt;
+      if (curr.method === PaymentMethod.PAYPAL) acc.paypal += amt;
       return acc;
     }, { cash: 0, card: 0, paypal: 0 });
 
-    const mainIn = state.mainEntries.reduce((sum, e) => sum + e.cashIn, 0);
-    const mainOut = state.mainEntries.reduce((sum, e) => sum + e.cashOut, 0);
+    const opTotal = op.cash + op.card + op.paypal;
+
+    // Main Section Calculations
+    const mainCashInTotal = mainEntries.reduce((sum, e) => sum + (e.cashIn || 0), 0);
+    const mainCashOutTotal = mainEntries.reduce((sum, e) => sum + (e.cashOut || 0), 0);
+
+    // Rule 14: Combine Card/PayPal from OP and Main
+    const mainCard = mainEntries.filter(e => e.method === PaymentMethod.CARD).reduce((sum, e) => sum + (e.cashIn || 0), 0);
+    const mainPaypal = mainEntries.filter(e => e.method === PaymentMethod.PAYPAL).reduce((sum, e) => sum + (e.cashIn || 0), 0);
     
-    // Main Payment method totals
-    const mCard = state.mainEntries.filter(e => e.method === PaymentMethod.CARD).reduce((sum, e) => sum + e.cashIn, 0);
-    const mPaypal = state.mainEntries.filter(e => e.method === PaymentMethod.PAYPAL).reduce((sum, e) => sum + e.cashIn, 0);
+    const grandCard = op.card + mainCard;
+    const grandPaypal = op.paypal + mainPaypal;
 
-    // Combined Card/PayPal (Rule 14)
-    const totalCard = mCard + op.card;
-    const totalPaypal = mPaypal + op.paypal;
+    // Rule 13: Final Cash In
+    const finalCashIn = mainCashInTotal + opTotal;
 
-    // Final Cash In (Rule 13)
-    const finalIn = mainIn + op.cash + op.card + op.paypal;
+    // Rule 15: Final Cash Out (Base Cash Out + Grand Card + Grand PayPal)
+    const finalCashOut = mainCashOutTotal + grandCard + grandPaypal;
 
-    // Final Cash Out (Rule 15: includes card/paypal totals)
-    const finalOut = mainOut + totalCard + totalPaypal;
+    // Rule 16: Final Balance
+    const finalBalance = finalCashIn - finalCashOut;
 
-    // Balance (Rule 16)
-    const balance = finalIn - finalOut;
+    return { op, grandCard, grandPaypal, finalCashIn, finalCashOut, finalBalance };
+  }, [state]);
 
-    return { op, totalCard, totalPaypal, finalIn, finalOut, balance };
-  }, [state.outPartyEntries, state.mainEntries]);
-
-  // --- Handlers ---
+  // --- Master Handlers (Laptop Only) ---
   const addOP = () => {
-    if (!isLaptop) return;
-    const next = { id: crypto.randomUUID(), index: state.outPartyEntries.length + 1, amount: 0, method: PaymentMethod.CASH };
-    pushState({ ...state, outPartyEntries: [...state.outPartyEntries, next] });
+    const outPartyEntries = state.outPartyEntries || [];
+    masterUpdate({ ...state, outPartyEntries: [...outPartyEntries, { id: crypto.randomUUID(), index: outPartyEntries.length + 1, amount: 0, method: PaymentMethod.CASH }] });
   };
-
+  
   const editOP = (id: string, field: keyof OutPartyEntry, val: any) => {
-    if (!isLaptop) return;
-    const next = state.outPartyEntries.map(e => e.id === id ? { ...e, [field]: val } : e);
-    pushState({ ...state, outPartyEntries: next });
+    const outPartyEntries = state.outPartyEntries || [];
+    const next = outPartyEntries.map(e => e.id === id ? { ...e, [field]: val } : e);
+    masterUpdate({ ...state, outPartyEntries: next });
   };
 
   const delOP = (id: string) => {
-    if (!isLaptop) return;
-    const next = state.outPartyEntries.filter(e => e.id !== id).map((e, i) => ({ ...e, index: i + 1 }));
-    pushState({ ...state, outPartyEntries: next });
+    const outPartyEntries = state.outPartyEntries || [];
+    const next = outPartyEntries.filter(e => e.id !== id).map((e, i) => ({ ...e, index: i + 1 }));
+    masterUpdate({ ...state, outPartyEntries: next });
   };
 
   const addM = () => {
-    if (!isLaptop) return;
-    const next = { id: crypto.randomUUID(), roomNo: '', description: '', method: PaymentMethod.CASH, cashIn: 0, cashOut: 0 };
-    pushState({ ...state, mainEntries: [...state.mainEntries, next] });
+    const mainEntries = state.mainEntries || [];
+    masterUpdate({ ...state, mainEntries: [...mainEntries, { id: crypto.randomUUID(), roomNo: '', description: '', method: PaymentMethod.CASH, cashIn: 0, cashOut: 0 }] });
   };
 
   const editM = (id: string, field: keyof MainEntry, val: any) => {
-    if (!isLaptop) return;
-    const next = state.mainEntries.map(e => e.id === id ? { ...e, [field]: val } : e);
-    pushState({ ...state, mainEntries: next });
+    const mainEntries = state.mainEntries || [];
+    const next = mainEntries.map(e => e.id === id ? { ...e, [field]: val } : e);
+    masterUpdate({ ...state, mainEntries: next });
   };
 
   const delM = (id: string) => {
-    if (!isLaptop) return;
-    pushState({ ...state, mainEntries: state.mainEntries.filter(e => e.id !== id) });
+    const mainEntries = state.mainEntries || [];
+    masterUpdate({ ...state, mainEntries: mainEntries.filter(e => e.id !== id) });
   };
 
-  const runDayEnd = () => {
-    if (!isLaptop || !confirm("DAY END: Wipe board and move to next date?")) return;
+  const doDayEnd = () => {
+    if (!confirm("DAY END: Archive data and reset for tomorrow?")) return;
     syncService.saveToHistory({ date: state.currentDate, data: state });
     const d = new Date(); d.setDate(d.getDate() + 1);
-    pushState({
+    masterUpdate({
       currentDate: d.toLocaleDateString('en-GB'),
       outPartyEntries: [],
       mainEntries: [],
       exchangeRates: state.exchangeRates,
-      openingBalance: calc.balance
+      openingBalance: totals.finalBalance
     });
     setHistory(syncService.getHistory());
   };
 
   return (
-    <div className="min-h-screen bg-slate-50 flex flex-col font-sans">
+    <div className="min-h-screen bg-slate-100 flex flex-col font-sans text-black">
       
-      {/* Top Header (Rule 9, 12) */}
-      <header className="bg-white border-b border-slate-200 sticky top-0 z-50 px-6 py-4 shadow-sm backdrop-blur-md bg-white/95">
-        <div className="max-w-[1700px] mx-auto flex flex-wrap items-center justify-between gap-6">
+      {/* Header */}
+      <header className="bg-white border-b border-slate-200 sticky top-0 z-50 px-6 py-5 shadow-sm">
+        <div className="max-w-[1750px] mx-auto flex flex-wrap items-center justify-between gap-6">
           <div className="flex items-center gap-6">
-            <div className="w-14 h-14 bg-black rounded-2xl flex items-center justify-center text-white shadow-xl shadow-slate-200 ring-4 ring-slate-100">
-              <span className="font-black text-xl tracking-tighter">SB</span>
+            <div className="w-16 h-16 bg-black rounded-3xl flex items-center justify-center text-white shadow-2xl">
+              <span className="font-black text-2xl tracking-tighter">SB</span>
             </div>
             <div>
-              <h1 className="text-2xl font-black tracking-tight text-black uppercase">Shivas Beach Cabanas</h1>
-              <p className="text-[11px] font-black text-slate-400 mt-0.5 uppercase tracking-[0.4em]">{state.currentDate}</p>
+              <h1 className="text-3xl font-black tracking-tighter uppercase">Shivas Beach Cabanas</h1>
+              <p className="text-[11px] font-black text-slate-400 mt-0.5 uppercase tracking-[0.5em]">{state.currentDate}</p>
             </div>
           </div>
 
-          <div className="flex items-center gap-10">
-            <div className="flex gap-10">
+          <div className="flex items-center gap-12">
+            <div className="flex gap-12 border-r border-slate-200 pr-12">
               <div className="text-right">
-                <Label>USD / LKR</Label>
-                <div className="text-xl font-black text-black leading-none">Rs. {state.exchangeRates.usd}</div>
+                <Label>USD Rate</Label>
+                <div className="text-2xl font-black leading-none">Rs. {state.exchangeRates?.usd ?? 0}</div>
               </div>
-              <div className="text-right border-l border-slate-200 pl-10">
-                <Label>EUR / LKR</Label>
-                <div className="text-xl font-black text-black leading-none">Rs. {state.exchangeRates.eur}</div>
+              <div className="text-right">
+                <Label>EUR Rate</Label>
+                <div className="text-2xl font-black leading-none">Rs. {state.exchangeRates?.eur ?? 0}</div>
               </div>
             </div>
-            
             <div className="flex gap-3">
-              <button onClick={() => setShowHistory(true)} className="px-5 py-3 bg-slate-100 hover:bg-slate-200 rounded-xl text-[10px] font-black uppercase tracking-widest text-black">Records</button>
-              {isLaptop && (
-                <button onClick={runDayEnd} className="px-5 py-3 bg-red-600 hover:bg-red-700 text-white rounded-xl text-[10px] font-black uppercase tracking-widest shadow-xl shadow-red-200">Day End</button>
-              )}
+              <button onClick={() => setShowHistory(true)} className="px-6 py-3.5 bg-slate-100 hover:bg-slate-200 rounded-2xl text-[10px] font-black uppercase tracking-widest transition-all text-black">Records</button>
+              {isLaptop && <button onClick={doDayEnd} className="px-6 py-3.5 bg-red-600 hover:bg-red-700 text-white rounded-2xl text-[10px] font-black uppercase tracking-widest shadow-xl shadow-red-100">Day End</button>}
             </div>
           </div>
         </div>
       </header>
 
-      <main className="flex-1 max-w-[1700px] w-full mx-auto p-4 md:p-10 space-y-10">
+      <main className="flex-1 max-w-[1750px] w-full mx-auto p-4 md:p-10 space-y-10">
         
-        {/* Highlighted Balance Totals (Rule 17) */}
-        <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
-          <div className="bg-blue-600 rounded-[2.5rem] p-10 text-white shadow-2xl shadow-blue-200 ring-8 ring-blue-50 relative overflow-hidden">
+        {/* Highlight Totals */}
+        <div className="grid grid-cols-1 md:grid-cols-3 gap-8">
+          <div className="bg-blue-600 rounded-[3rem] p-12 text-white shadow-2xl relative overflow-hidden">
             <Label className="text-blue-100">Total Cash In</Label>
-            <div className="text-5xl font-black tracking-tight z-10 relative">Rs. {calc.finalIn.toLocaleString()}</div>
-            <div className="absolute -bottom-10 -right-10 opacity-10"><svg className="w-48 h-48" fill="currentColor" viewBox="0 0 24 24"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm1 15h-2v-6h2v6zm0-8h-2V7h2v2z"/></svg></div>
+            <div className="text-6xl font-black tracking-tighter">Rs. {(totals.finalIn ?? 0).toLocaleString()}</div>
           </div>
-          <div className="bg-red-600 rounded-[2.5rem] p-10 text-white shadow-2xl shadow-red-200 ring-8 ring-red-50 relative overflow-hidden">
+          <div className="bg-red-600 rounded-[3rem] p-12 text-white shadow-2xl relative overflow-hidden">
             <Label className="text-red-100">Total Cash Out</Label>
-            <div className="text-5xl font-black tracking-tight z-10 relative">Rs. {calc.finalOut.toLocaleString()}</div>
-            <div className="absolute -bottom-10 -right-10 opacity-10 rotate-45"><svg className="w-48 h-48" fill="currentColor" viewBox="0 0 24 24"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm1 15h-2v-6h2v6zm0-8h-2V7h2v2z"/></svg></div>
+            <div className="text-6xl font-black tracking-tighter">Rs. {(totals.finalOut ?? 0).toLocaleString()}</div>
           </div>
-          <div className="bg-emerald-600 rounded-[2.5rem] p-10 text-white shadow-2xl shadow-emerald-200 ring-8 ring-emerald-50 relative overflow-hidden">
-            <Label className="text-emerald-100 font-bold">Current Final Balance</Label>
-            <div className="text-5xl font-black tracking-tight z-10 relative">Rs. {calc.balance.toLocaleString()}</div>
-            <div className="absolute -bottom-10 -right-10 opacity-10"><svg className="w-48 h-48" fill="currentColor" viewBox="0 0 24 24"><path d="M21 18v1c0 1.1-.9 2-2 2H5c-1.1 0-2-.9-2-2V5c0-1.1.9-2 2-2h14c1.1 0 2 .9 2 2v1h-9c-1.1 0-2 .9-2 2v8c0 1.1.9 2 2 2h9zm-9-2h10V8H12v8zm4-2.5c-.83 0-1.5-.67-1.5-1.5s.67-1.5 1.5-1.5 1.5.67 1.5 1.5-.67 1.5-1.5 1.5z"/></svg></div>
+          <div className="bg-emerald-600 rounded-[3rem] p-12 text-white shadow-2xl relative overflow-hidden">
+            <Label className="text-emerald-100">Final Balance</Label>
+            <div className="text-6xl font-black tracking-tighter">Rs. {(totals.finalBalance ?? 0).toLocaleString()}</div>
           </div>
         </div>
 
-        {/* Card & PayPal Summaries (Rule 14) */}
-        <div className="grid grid-cols-1 sm:grid-cols-2 gap-6">
-          <div className="bg-amber-50 border-2 border-amber-200 p-8 rounded-[2rem] flex justify-between items-center shadow-inner">
-             <span className="text-amber-900 font-black uppercase text-xs tracking-[0.2em]">Grand Card Total</span>
-             <span className="text-amber-600 font-black text-4xl">Rs. {calc.totalCard.toLocaleString()}</span>
+        {/* Card/PayPal Summaries */}
+        <div className="grid grid-cols-1 sm:grid-cols-2 gap-8">
+          <div className="bg-amber-100 border-4 border-amber-200 p-10 rounded-[2.5rem] flex justify-between items-center">
+            <span className="text-amber-900 font-black uppercase text-sm tracking-widest">Grand Card Total</span>
+            <span className="text-amber-600 font-black text-5xl">Rs. {(totals.grandCard ?? 0).toLocaleString()}</span>
           </div>
-          <div className="bg-purple-50 border-2 border-purple-200 p-8 rounded-[2rem] flex justify-between items-center shadow-inner">
-             <span className="text-purple-900 font-black uppercase text-xs tracking-[0.2em]">Grand PayPal Total</span>
-             <span className="text-purple-600 font-black text-4xl">Rs. {calc.totalPaypal.toLocaleString()}</span>
+          <div className="bg-purple-100 border-4 border-purple-200 p-10 rounded-[2.5rem] flex justify-between items-center">
+            <span className="text-purple-900 font-black uppercase text-sm tracking-widest">Grand PayPal Total</span>
+            <span className="text-purple-600 font-black text-5xl">Rs. {(totals.grandPaypal ?? 0).toLocaleString()}</span>
           </div>
         </div>
 
         <div className="grid grid-cols-1 xl:grid-cols-12 gap-10">
           
-          {/* Out Party List (Rule 5, 6, 8, 18) */}
+          {/* Out Party List */}
           <div className="xl:col-span-4">
-            <SectionContainer title="Out Party Section" isLaptop={isLaptop}>
-              <div className="space-y-4 max-h-[500px] overflow-y-auto pr-2 no-scrollbar">
-                {state.outPartyEntries.map((entry) => (
-                  <div key={entry.id} className="group bg-slate-50 border-2 border-slate-100 rounded-2xl p-5 flex items-center gap-5 hover:border-blue-400 transition-all">
-                    <div className="w-10 h-10 bg-black text-white rounded-xl flex items-center justify-center text-xs font-black shadow-lg">
-                      {entry.index}
-                    </div>
+            <Section title="Out Party Section" isLaptop={isLaptop}>
+              <div className="space-y-4 max-h-[600px] overflow-y-auto no-scrollbar pr-2">
+                {(state.outPartyEntries || []).map((e) => (
+                  <div key={e.id} className="group bg-slate-50 border-2 border-slate-100 rounded-2xl p-6 flex items-center gap-6 hover:border-blue-400 transition-all">
+                    <div className="w-12 h-12 bg-black text-white rounded-xl flex items-center justify-center text-sm font-black shadow-lg">{e.index}</div>
                     <div className="flex-1 space-y-2">
                       <div className="flex items-center gap-2">
-                        <span className="text-[10px] font-black text-slate-400">Rs.</span>
+                        <span className="text-xs font-black text-slate-400">Rs.</span>
                         <input 
                           type="number"
                           readOnly={!isLaptop}
-                          value={entry.amount || ''}
-                          onChange={(e) => editOP(entry.id, 'amount', parseFloat(e.target.value) || 0)}
-                          className="bg-transparent text-xl font-black text-black w-full outline-none"
+                          value={e.amount || ''}
+                          onChange={(v) => editOP(e.id, 'amount', parseFloat(v.target.value) || 0)}
+                          className="bg-transparent text-2xl font-black text-black w-full outline-none"
                           placeholder="0"
                         />
                       </div>
                       <select 
                         disabled={!isLaptop}
-                        value={entry.method}
-                        onChange={(e) => editOP(entry.id, 'method', e.target.value as PaymentMethod)}
-                        className={`bg-white border border-slate-200 rounded-lg px-2 py-1 text-[9px] font-black uppercase tracking-widest outline-none transition-colors ${
-                          entry.method === PaymentMethod.CASH ? 'text-blue-600' : 
-                          entry.method === PaymentMethod.CARD ? 'text-amber-600' : 'text-purple-600'
+                        value={e.method}
+                        onChange={(v) => editOP(e.id, 'method', v.target.value as PaymentMethod)}
+                        className={`bg-white border-2 border-slate-200 rounded-xl px-3 py-1.5 text-[10px] font-black uppercase tracking-widest outline-none ${
+                          e.method === PaymentMethod.CASH ? 'text-blue-600' : e.method === PaymentMethod.CARD ? 'text-amber-600' : 'text-purple-600'
                         }`}
                       >
                         {Object.values(PaymentMethod).map(m => <option key={m} value={m}>{m}</option>)}
                       </select>
                     </div>
                     {isLaptop && (
-                      <button onClick={() => delOP(entry.id)} className="text-slate-300 hover:text-red-500 opacity-0 group-hover:opacity-100 transition-all">
-                        <svg className="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2.5" d="M6 18L18 6M6 6l12 12" /></svg>
+                      <button onClick={() => delOP(e.id)} className="text-slate-300 hover:text-red-500 opacity-0 group-hover:opacity-100 transition-all">
+                        <svg className="w-7 h-7" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2.5" d="M6 18L18 6M6 6l12 12" /></svg>
                       </button>
                     )}
                   </div>
                 ))}
               </div>
-
               {isLaptop && (
-                <button onClick={addOP} className="w-full mt-6 py-4 border-2 border-dashed border-slate-300 rounded-2xl text-slate-400 font-black text-[10px] uppercase tracking-[0.4em] hover:bg-white hover:border-blue-500 hover:text-blue-500 transition-all flex items-center justify-center gap-3">
+                <button onClick={addOP} className="w-full mt-8 py-5 border-2 border-dashed border-slate-300 rounded-3xl text-slate-400 font-black text-[11px] uppercase tracking-[0.4em] hover:bg-white hover:border-blue-500 hover:text-blue-500 transition-all">
                    Add Out Party Entry
                 </button>
               )}
-
-              <div className="mt-8 pt-8 border-t border-slate-100 space-y-4">
-                <div className="flex justify-between items-center">
-                   <Label className="mb-0">OP Cash Total</Label>
-                   <span className="text-blue-600 font-black text-lg">Rs. {calc.op.cash.toLocaleString()}</span>
-                </div>
-                <div className="flex justify-between items-center">
-                   <Label className="mb-0">OP Card Total</Label>
-                   <span className="text-amber-600 font-black text-lg">Rs. {calc.op.card.toLocaleString()}</span>
-                </div>
-                <div className="flex justify-between items-center">
-                   <Label className="mb-0">OP PayPal Total</Label>
-                   <span className="text-purple-700 font-black text-lg">Rs. {calc.op.paypal.toLocaleString()}</span>
-                </div>
+              <div className="mt-10 pt-10 border-t-2 border-slate-100 space-y-6">
+                <div className="flex justify-between items-center"><Label className="m-0">OP Cash Total</Label><span className="text-blue-700 font-black text-xl">Rs. {(totals.op.cash ?? 0).toLocaleString()}</span></div>
+                <div className="flex justify-between items-center"><Label className="m-0">OP Card Total</Label><span className="text-amber-600 font-black text-xl">Rs. {(totals.op.card ?? 0).toLocaleString()}</span></div>
+                <div className="flex justify-between items-center"><Label className="m-0">OP PayPal Total</Label><span className="text-purple-700 font-black text-xl">Rs. {(totals.op.paypal ?? 0).toLocaleString()}</span></div>
               </div>
-            </SectionContainer>
+            </Section>
           </div>
 
-          {/* Main Section (Rule 10, 18, 19) */}
+          {/* Main Section Dashboard */}
           <div className="xl:col-span-8">
-            <SectionContainer title="Main Section Entry Dashboard" isLaptop={isLaptop}>
+            <Section title="Main Section Dashboard" isLaptop={isLaptop}>
               <div className="overflow-x-auto no-scrollbar">
-                <table className="w-full text-left border-separate border-spacing-y-3">
+                <table className="w-full text-left border-separate border-spacing-y-4">
                   <thead>
-                    <tr className="text-slate-400 font-black text-[9px] uppercase tracking-[0.2em]">
-                      <th className="px-4 py-2">Room</th>
-                      <th className="px-4 py-2 min-w-[300px]">Description</th>
-                      <th className="px-4 py-2 text-center">Method</th>
-                      <th className="px-4 py-2 text-right">Cash In</th>
-                      <th className="px-4 py-2 text-right">Cash Out</th>
-                      {isLaptop && <th className="px-4 py-2 w-10"></th>}
+                    <tr className="text-slate-400 font-black text-[10px] uppercase tracking-widest">
+                      <th className="px-6 py-2">Room</th>
+                      <th className="px-6 py-2 min-w-[350px]">Description</th>
+                      <th className="px-6 py-2 text-center">Method</th>
+                      <th className="px-6 py-2 text-right">Cash In</th>
+                      <th className="px-6 py-2 text-right">Cash Out</th>
+                      {isLaptop && <th className="px-6 py-2 w-10"></th>}
                     </tr>
                   </thead>
                   <tbody>
-                    {state.mainEntries.map((entry) => (
-                      <tr key={entry.id} className="group bg-slate-50/80 rounded-2xl">
-                        <td className="px-4 py-4 first:rounded-l-2xl">
-                          <input 
-                            type="text"
-                            readOnly={!isLaptop}
-                            value={entry.roomNo}
-                            onChange={(e) => editM(entry.id, 'roomNo', e.target.value)}
-                            placeholder="Rm #"
-                            className="bg-transparent font-black text-black w-full outline-none"
-                          />
+                    {(state.mainEntries || []).map((e) => (
+                      <tr key={e.id} className="group bg-slate-50/50 rounded-3xl">
+                        <td className="px-6 py-6 first:rounded-l-[2rem]">
+                          <input type="text" readOnly={!isLaptop} value={e.roomNo} onChange={(v) => editM(e.id, 'roomNo', v.target.value)} placeholder="Rm #" className="bg-transparent font-black text-black w-full outline-none" />
                         </td>
-                        <td className="px-4 py-4">
-                          <input 
-                            type="text"
-                            readOnly={!isLaptop}
-                            value={entry.description}
-                            onChange={(e) => editM(entry.id, 'description', e.target.value)}
-                            placeholder="Wider description field..."
-                            className="bg-transparent font-bold text-slate-800 w-full outline-none italic placeholder:text-slate-300"
-                          />
+                        <td className="px-6 py-6">
+                          <input type="text" readOnly={!isLaptop} value={e.description} onChange={(v) => editM(e.id, 'description', v.target.value)} placeholder="Wider description field..." className="bg-transparent font-bold text-slate-800 w-full outline-none italic" />
                         </td>
-                        <td className="px-4 py-4 text-center">
+                        <td className="px-6 py-6 text-center">
                           <select 
                             disabled={!isLaptop}
-                            value={entry.method}
-                            onChange={(e) => editM(entry.id, 'method', e.target.value as PaymentMethod)}
-                            className={`bg-transparent font-black text-[9px] uppercase tracking-widest outline-none ${
-                              entry.method === PaymentMethod.CASH ? 'text-blue-600' : 
-                              entry.method === PaymentMethod.CARD ? 'text-amber-600' : 'text-purple-600'
+                            value={e.method}
+                            onChange={(v) => editM(e.id, 'method', v.target.value as PaymentMethod)}
+                            className={`bg-transparent font-black text-[10px] uppercase tracking-widest outline-none ${
+                              e.method === PaymentMethod.CASH ? 'text-blue-600' : e.method === PaymentMethod.CARD ? 'text-amber-600' : 'text-purple-600'
                             }`}
                           >
                             {Object.values(PaymentMethod).map(m => <option key={m} value={m}>{m}</option>)}
                           </select>
                         </td>
-                        <td className="px-4 py-4 text-right">
-                          <input 
-                            type="number"
-                            readOnly={!isLaptop}
-                            value={entry.cashIn || ''}
-                            onChange={(e) => editM(entry.id, 'cashIn', parseFloat(e.target.value) || 0)}
-                            className="bg-transparent text-right font-black text-blue-700 w-full outline-none"
-                            placeholder="0"
-                          />
+                        <td className="px-6 py-6 text-right">
+                          <input type="number" readOnly={!isLaptop} value={e.cashIn || ''} onChange={(v) => editM(e.id, 'cashIn', parseFloat(v.target.value) || 0)} className="bg-transparent text-right font-black text-blue-700 w-full outline-none" placeholder="0" />
                         </td>
-                        <td className="px-4 py-4 text-right">
-                          <input 
-                            type="number"
-                            readOnly={!isLaptop}
-                            value={entry.cashOut || ''}
-                            onChange={(e) => editM(entry.id, 'cashOut', parseFloat(e.target.value) || 0)}
-                            className="bg-transparent text-right font-black text-red-600 w-full outline-none"
-                            placeholder="0"
-                          />
+                        <td className="px-6 py-6 text-right">
+                          <input type="number" readOnly={!isLaptop} value={e.cashOut || ''} onChange={(v) => editM(e.id, 'cashOut', parseFloat(v.target.value) || 0)} className="bg-transparent text-right font-black text-red-600 w-full outline-none" placeholder="0" />
                         </td>
                         {isLaptop && (
-                          <td className="px-4 py-4 last:rounded-r-2xl text-center">
-                            <button onClick={() => delM(entry.id)} className="text-slate-300 hover:text-red-500 opacity-0 group-hover:opacity-100 transition-all">
-                              <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2.5" d="M6 18L18 6M6 6l12 12" /></svg>
+                          <td className="px-6 py-6 last:rounded-r-[2rem] text-center">
+                            <button onClick={() => delM(e.id)} className="text-slate-300 hover:text-red-500 opacity-0 group-hover:opacity-100 transition-all">
+                              <svg className="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2.5" d="M6 18L18 6M6 6l12 12" /></svg>
                             </button>
                           </td>
                         )}
@@ -413,55 +375,43 @@ export default function App() {
                   </tbody>
                 </table>
               </div>
-
               {isLaptop && (
-                <button onClick={addM} className="w-full mt-6 py-6 bg-black text-white rounded-[2rem] font-black text-[10px] uppercase tracking-[0.4em] shadow-2xl shadow-slate-300 hover:scale-[1.01] transition-all flex items-center justify-center gap-4">
+                <button onClick={addM} className="w-full mt-10 py-7 bg-black text-white rounded-[2.5rem] font-black text-[12px] uppercase tracking-[0.5em] shadow-2xl hover:scale-[1.01] transition-all">
                   Add New Entry to Main Log
                 </button>
               )}
-            </SectionContainer>
+            </Section>
           </div>
         </div>
       </main>
 
-      <footer className="bg-slate-900 px-8 py-5 text-slate-500">
-        <div className="max-w-[1700px] mx-auto flex justify-between items-center">
-          <div className="flex items-center gap-3">
-            <div className={`w-2 h-2 rounded-full animate-pulse shadow-lg ${isLaptop ? 'bg-emerald-500' : 'bg-blue-400'}`}></div>
-            <span className="text-[10px] font-black uppercase tracking-[0.4em]">Cloud Relay: {device.toUpperCase()} MODE ACTIVE</span>
+      <footer className="bg-slate-900 px-8 py-6 text-slate-500 border-t border-slate-800">
+        <div className="max-w-[1750px] mx-auto flex justify-between items-center">
+          <div className="flex items-center gap-4">
+            <div className={`w-3 h-3 rounded-full animate-pulse shadow-lg ${isLaptop ? 'bg-emerald-500' : 'bg-blue-400'}`}></div>
+            <span className="text-[11px] font-black uppercase tracking-[0.5em]">Sync Status: {device.toUpperCase()} CLOUD LINK SECURED</span>
           </div>
-          <div className="text-[9px] font-black uppercase tracking-widest italic opacity-40">Shivas Beach Cabanas Financial System v5.0</div>
+          <div className="text-[10px] font-black uppercase tracking-widest italic opacity-30">Shivas Beach Cabanas Financial Suite v6.0 • Cross-Network Live Sync</div>
         </div>
       </footer>
 
-      {/* Record Archive Modal */}
       {showHistory && (
         <div className="fixed inset-0 z-[100] bg-black/95 backdrop-blur-2xl flex items-center justify-center p-4">
-          <div className="bg-white w-full max-w-6xl rounded-[3rem] shadow-2xl flex flex-col max-h-[90vh] overflow-hidden">
-            <div className="bg-slate-100 p-8 md:p-10 flex justify-between items-center border-b border-slate-200">
-              <h3 className="text-2xl font-black text-black uppercase tracking-widest">Financial Records History</h3>
+          <div className="bg-white w-full max-w-6xl rounded-[4rem] shadow-2xl flex flex-col max-h-[85vh] overflow-hidden">
+            <div className="bg-slate-100 p-10 flex justify-between items-center border-b border-slate-200">
+              <h3 className="text-3xl font-black text-black uppercase tracking-widest">Financial Archives</h3>
               <button onClick={() => setShowHistory(false)} className="p-4 hover:bg-white rounded-full transition-all text-slate-400 hover:text-black">
-                <svg className="w-8 h-8" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="3" d="M6 18L18 6M6 6l12 12" /></svg>
+                <svg className="w-10 h-10" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="3" d="M6 18L18 6M6 6l12 12" /></svg>
               </button>
             </div>
-            <div className="flex-1 overflow-y-auto p-6 md:p-12 space-y-6 scrollbar-thin">
+            <div className="flex-1 overflow-y-auto p-12 space-y-8 scrollbar-thin text-black">
               {history.length === 0 ? (
-                <div className="py-24 text-center text-slate-300 font-black italic uppercase tracking-widest opacity-50">No archived records found.</div>
+                <div className="py-24 text-center text-slate-300 font-black italic uppercase tracking-widest opacity-40">No records found.</div>
               ) : (
-                history.map((record, i) => (
-                  <div key={i} className="p-8 bg-slate-50 rounded-[2.5rem] border-2 border-slate-100 hover:border-blue-400 transition-all">
-                    <div className="flex flex-wrap justify-between items-end gap-10">
-                      <div>
-                        <Label>Archive Date</Label>
-                        <div className="text-3xl font-black text-black">{record.date}</div>
-                      </div>
-                      <div className="grid grid-cols-2 gap-12">
-                        <div>
-                          <Label>Closing Balance</Label>
-                          <div className="font-black text-emerald-700 text-3xl">Rs. {record.data.openingBalance.toLocaleString()}</div>
-                        </div>
-                      </div>
-                    </div>
+                history.map((h, i) => (
+                  <div key={i} className="p-12 bg-slate-50 rounded-[3.5rem] border-2 border-slate-100 hover:border-blue-500 transition-all flex justify-between items-end">
+                    <div><Label>Archive Date</Label><div className="text-4xl font-black">{h.date}</div></div>
+                    <div className="text-right"><Label>Closing Balance</Label><div className="text-4xl font-black text-emerald-700">Rs. {(h.data?.openingBalance ?? 0).toLocaleString()}</div></div>
                   </div>
                 ))
               )}

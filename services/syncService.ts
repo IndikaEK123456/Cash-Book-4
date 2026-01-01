@@ -2,12 +2,12 @@
 import { CashBookState } from '../types';
 
 /**
- * SHIVAS LIVE CLOUD RELAY (JSONBLOB)
- * Optimized with cache-busting for real-time Laptop-to-Mobile sync.
+ * SHIVAS MASTER RELAY ENGINE
+ * Designed for 1-second latency between Laptop and Mobile.
  */
 
-// Stable ID for Shivas Beach Cabanas - This acts as your private channel.
-const BLOB_ID = '1344265780516626432'; 
+// Unique channel for Shivas Beach Cabanas
+const BLOB_ID = '1344403164629569536'; 
 const CLOUD_URL = `https://jsonblob.com/api/jsonBlob/${BLOB_ID}`;
 
 const STORAGE_KEY = 'shivas_local_cache';
@@ -16,7 +16,7 @@ const HISTORY_KEY = 'shivas_history';
 export const saveState = async (state: CashBookState): Promise<boolean> => {
   if (!state) return false;
   
-  // Save locally for instant offline persistence
+  // Local backup
   localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
 
   try {
@@ -24,27 +24,31 @@ export const saveState = async (state: CashBookState): Promise<boolean> => {
       method: 'PUT',
       headers: { 
         'Content-Type': 'application/json',
-        'Cache-Control': 'no-cache',
-        'Pragma': 'no-cache'
+        'Cache-Control': 'no-store, no-cache, must-revalidate, proxy-revalidate',
+        'Pragma': 'no-cache',
+        'Expires': '0'
       },
-      body: JSON.stringify(state),
+      body: JSON.stringify({
+        ...state,
+        lastSyncTimestamp: Date.now() // Force a change in the data object
+      }),
     });
     return response.ok;
   } catch (e) {
-    console.error("Cloud Sync Push Failed:", e);
+    console.error("Laptop Push Failed:", e);
     return false;
   }
 };
 
 export const getState = async (): Promise<CashBookState | null> => {
   try {
-    // CRITICAL: Append timestamp to URL to bypass mobile browser caching
-    const cacheBuster = `?t=${Date.now()}`;
-    const response = await fetch(CLOUD_URL + cacheBuster, {
+    // DOUBLE CACHE BUSTER: Unique ID + Timestamp to force fresh download
+    const buster = `?cb=${Math.random()}&t=${Date.now()}`;
+    const response = await fetch(CLOUD_URL + buster, {
       method: 'GET',
       headers: { 
         'Accept': 'application/json',
-        'Cache-Control': 'no-cache',
+        'Cache-Control': 'no-store, no-cache, must-revalidate',
         'Pragma': 'no-cache'
       }
     });
@@ -55,10 +59,9 @@ export const getState = async (): Promise<CashBookState | null> => {
       }
     }
   } catch (e) {
-    console.warn("Cloud Sync Pull Unavailable");
+    console.warn("Mobile Pull Failed");
   }
 
-  // Fallback to local if cloud is down
   const local = localStorage.getItem(STORAGE_KEY);
   if (!local) return null;
   try {

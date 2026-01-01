@@ -10,7 +10,6 @@ import {
 } from './types';
 import * as syncService from './services/syncService';
 
-// --- UI Framework ---
 const CURRENCY = 'Rs.';
 
 const Label = ({ children, className = "" }: { children?: React.ReactNode, className?: string }) => (
@@ -26,7 +25,7 @@ const Section = ({ title, children, isLaptop }: { title: string, children?: Reac
       {!isLaptop && (
         <div className="flex items-center gap-2">
           <div className="w-2 h-2 rounded-full bg-blue-500 animate-pulse"></div>
-          <span className="text-blue-400 text-[9px] font-black uppercase tracking-widest">Live Viewer</span>
+          <span className="text-blue-400 text-[9px] font-black uppercase tracking-widest">LIVE VIEWER MODE</span>
         </div>
       )}
     </div>
@@ -36,6 +35,7 @@ const Section = ({ title, children, isLaptop }: { title: string, children?: Reac
 
 export default function App() {
   const [device, setDevice] = useState<DeviceType>(DeviceType.LAPTOP);
+  const [isSyncing, setIsSyncing] = useState(true);
   const [state, setState] = useState<CashBookState>({
     currentDate: new Date().toLocaleDateString('en-GB'),
     outPartyEntries: [],
@@ -46,10 +46,11 @@ export default function App() {
   const [showHistory, setShowHistory] = useState(false);
   const [history, setHistory] = useState<HistoryRecord[]>([]);
   
-  // Ref to track state for sync comparison
+  // Track sync state for comparison and debouncing
   const stateJsonRef = useRef(JSON.stringify(state));
+  const syncTimeoutRef = useRef<number | null>(null);
 
-  // Device and Connection Setup
+  // 1. Initialize Device & Connection
   useEffect(() => {
     const handleDevice = () => {
       const hash = window.location.hash.toLowerCase();
@@ -59,32 +60,38 @@ export default function App() {
       else if (isMobile) setDevice(DeviceType.ANDROID);
       else setDevice(DeviceType.LAPTOP);
     };
-
     handleDevice();
     window.addEventListener('hashchange', handleDevice);
 
-    // Initial Fetch
-    syncService.getState().then(s => { 
-      if(s && s.outPartyEntries && s.mainEntries) {
-        setState(s); 
-        stateJsonRef.current = JSON.stringify(s);
+    // Initial Load from Cloud
+    const initFetch = async () => {
+      setIsSyncing(true);
+      const cloud = await syncService.getState();
+      if (cloud) {
+        setState(cloud);
+        stateJsonRef.current = JSON.stringify(cloud);
       }
-    });
+      setIsSyncing(false);
+    };
+    initFetch();
     setHistory(syncService.getHistory());
 
-    // Rule 3: AGGRESSIVE AUTO-RECONNECT SYNC (Every 1.2 seconds)
+    // 2. Continuous Sync Loop (Rule 3)
     const syncLoop = setInterval(async () => {
       const cloud = await syncService.getState();
-      if (cloud && cloud.outPartyEntries && cloud.mainEntries) {
+      if (cloud) {
         const cloudJson = JSON.stringify(cloud);
+        // Only update if cloud is different and we haven't just sent something (laptop check)
         if (cloudJson !== stateJsonRef.current) {
           setState(cloud);
           stateJsonRef.current = cloudJson;
+          setIsSyncing(true);
+          setTimeout(() => setIsSyncing(false), 500);
         }
       }
-    }, 1200);
+    }, 1500);
 
-    // Rule 12: Exchange Rates
+    // 3. Exchange Rates (Rule 12)
     const fetchRates = async () => {
       try {
         const res = await fetch('https://api.exchangerate-api.com/v4/latest/USD');
@@ -111,19 +118,28 @@ export default function App() {
   // Master update function (laptop only)
   const masterUpdate = useCallback((next: CashBookState) => {
     if (!isLaptop) return;
+    
     setState(next);
-    stateJsonRef.current = JSON.stringify(next);
-    syncService.saveState(next);
+    const nextJson = JSON.stringify(next);
+    stateJsonRef.current = nextJson;
+
+    // Debounce cloud pushes to avoid hitting limits
+    if (syncTimeoutRef.current) window.clearTimeout(syncTimeoutRef.current);
+    syncTimeoutRef.current = window.setTimeout(async () => {
+      setIsSyncing(true);
+      await syncService.saveState(next);
+      setIsSyncing(false);
+    }, 500);
   }, [isLaptop]);
 
   // --- Calculation Engine (Rules 13, 14, 15, 16) ---
   const totals = useMemo(() => {
-    const outPartyEntries = state.outPartyEntries || [];
+    const opEntries = state.outPartyEntries || [];
     const mainEntries = state.mainEntries || [];
 
     // Out Party Totals
-    const op = outPartyEntries.reduce((acc, curr) => {
-      const amt = curr.amount || 0;
+    const op = opEntries.reduce((acc, curr) => {
+      const amt = Number(curr.amount) || 0;
       if (curr.method === PaymentMethod.CASH) acc.cash += amt;
       if (curr.method === PaymentMethod.CARD) acc.card += amt;
       if (curr.method === PaymentMethod.PAYPAL) acc.paypal += amt;
@@ -132,65 +148,55 @@ export default function App() {
 
     const opTotal = op.cash + op.card + op.paypal;
 
-    // Main Section Calculations
-    const mainCashInTotal = mainEntries.reduce((sum, e) => sum + (e.cashIn || 0), 0);
-    const mainCashOutTotal = mainEntries.reduce((sum, e) => sum + (e.cashOut || 0), 0);
+    // Main Totals
+    const mIn = mainEntries.reduce((sum, e) => sum + (Number(e.cashIn) || 0), 0);
+    const mOut = mainEntries.reduce((sum, e) => sum + (Number(e.cashOut) || 0), 0);
 
-    // Rule 14: Combine Card/PayPal from OP and Main
-    const mainCard = mainEntries.filter(e => e.method === PaymentMethod.CARD).reduce((sum, e) => sum + (e.cashIn || 0), 0);
-    const mainPaypal = mainEntries.filter(e => e.method === PaymentMethod.PAYPAL).reduce((sum, e) => sum + (e.cashIn || 0), 0);
+    // Rule 14: Combined Card/PayPal
+    const mCard = mainEntries.filter(e => e.method === PaymentMethod.CARD).reduce((sum, e) => sum + (Number(e.cashIn) || 0), 0);
+    const mPaypal = mainEntries.filter(e => e.method === PaymentMethod.PAYPAL).reduce((sum, e) => sum + (Number(e.cashIn) || 0), 0);
     
-    const grandCard = op.card + mainCard;
-    const grandPaypal = op.paypal + mainPaypal;
+    const grandCard = op.card + mCard;
+    const grandPaypal = op.paypal + mPaypal;
 
-    // Rule 13: Final Cash In
-    const finalCashIn = mainCashInTotal + opTotal;
+    // Final Totals
+    const finalIn = mIn + opTotal;
+    const finalOut = mOut + grandCard + grandPaypal;
+    const finalBalance = finalIn - finalOut;
 
-    // Rule 15: Final Cash Out (Base Cash Out + Grand Card + Grand PayPal)
-    const finalCashOut = mainCashOutTotal + grandCard + grandPaypal;
-
-    // Rule 16: Final Balance
-    const finalBalance = finalCashIn - finalCashOut;
-
-    return { op, grandCard, grandPaypal, finalCashIn, finalCashOut, finalBalance };
+    return { op, grandCard, grandPaypal, finalIn, finalOut, finalBalance };
   }, [state]);
 
   // --- Master Handlers (Laptop Only) ---
   const addOP = () => {
-    const outPartyEntries = state.outPartyEntries || [];
-    masterUpdate({ ...state, outPartyEntries: [...outPartyEntries, { id: crypto.randomUUID(), index: outPartyEntries.length + 1, amount: 0, method: PaymentMethod.CASH }] });
+    const list = state.outPartyEntries || [];
+    masterUpdate({ ...state, outPartyEntries: [...list, { id: crypto.randomUUID(), index: list.length + 1, amount: 0, method: PaymentMethod.CASH }] });
   };
   
   const editOP = (id: string, field: keyof OutPartyEntry, val: any) => {
-    const outPartyEntries = state.outPartyEntries || [];
-    const next = outPartyEntries.map(e => e.id === id ? { ...e, [field]: val } : e);
-    masterUpdate({ ...state, outPartyEntries: next });
+    const list = state.outPartyEntries || [];
+    masterUpdate({ ...state, outPartyEntries: list.map(e => e.id === id ? { ...e, [field]: val } : e) });
   };
 
   const delOP = (id: string) => {
-    const outPartyEntries = state.outPartyEntries || [];
-    const next = outPartyEntries.filter(e => e.id !== id).map((e, i) => ({ ...e, index: i + 1 }));
-    masterUpdate({ ...state, outPartyEntries: next });
+    const list = state.outPartyEntries || [];
+    masterUpdate({ ...state, outPartyEntries: list.filter(e => e.id !== id).map((e, i) => ({ ...e, index: i + 1 })) });
   };
 
   const addM = () => {
-    const mainEntries = state.mainEntries || [];
-    masterUpdate({ ...state, mainEntries: [...mainEntries, { id: crypto.randomUUID(), roomNo: '', description: '', method: PaymentMethod.CASH, cashIn: 0, cashOut: 0 }] });
+    const list = state.mainEntries || [];
+    masterUpdate({ ...state, mainEntries: [...list, { id: crypto.randomUUID(), roomNo: '', description: '', method: PaymentMethod.CASH, cashIn: 0, cashOut: 0 }] });
   };
 
   const editM = (id: string, field: keyof MainEntry, val: any) => {
-    const mainEntries = state.mainEntries || [];
-    const next = mainEntries.map(e => e.id === id ? { ...e, [field]: val } : e);
-    masterUpdate({ ...state, mainEntries: next });
+    const list = state.mainEntries || [];
+    masterUpdate({ ...state, mainEntries: list.map(e => e.id === id ? { ...e, [field]: val } : e) });
   };
 
-  const delM = (id: string) => {
-    const mainEntries = state.mainEntries || [];
-    masterUpdate({ ...state, mainEntries: mainEntries.filter(e => e.id !== id) });
-  };
+  const delM = (id: string) => masterUpdate({ ...state, mainEntries: (state.mainEntries || []).filter(e => e.id !== id) });
 
   const doDayEnd = () => {
-    if (!confirm("DAY END: Archive data and reset for tomorrow?")) return;
+    if (!confirm("DAY END: Archive current totals and reset for the new day?")) return;
     syncService.saveToHistory({ date: state.currentDate, data: state });
     const d = new Date(); d.setDate(d.getDate() + 1);
     masterUpdate({
@@ -204,13 +210,13 @@ export default function App() {
   };
 
   return (
-    <div className="min-h-screen bg-slate-100 flex flex-col font-sans text-black">
+    <div className="min-h-screen bg-slate-100 flex flex-col font-sans text-black selection:bg-blue-100">
       
-      {/* Header */}
+      {/* Dynamic Header */}
       <header className="bg-white border-b border-slate-200 sticky top-0 z-50 px-6 py-5 shadow-sm">
         <div className="max-w-[1750px] mx-auto flex flex-wrap items-center justify-between gap-6">
           <div className="flex items-center gap-6">
-            <div className="w-16 h-16 bg-black rounded-3xl flex items-center justify-center text-white shadow-2xl">
+            <div className="w-16 h-16 bg-black rounded-3xl flex items-center justify-center text-white shadow-xl">
               <span className="font-black text-2xl tracking-tighter">SB</span>
             </div>
             <div>
@@ -230,9 +236,13 @@ export default function App() {
                 <div className="text-2xl font-black leading-none">Rs. {state.exchangeRates?.eur ?? 0}</div>
               </div>
             </div>
-            <div className="flex gap-3">
-              <button onClick={() => setShowHistory(true)} className="px-6 py-3.5 bg-slate-100 hover:bg-slate-200 rounded-2xl text-[10px] font-black uppercase tracking-widest transition-all text-black">Records</button>
-              {isLaptop && <button onClick={doDayEnd} className="px-6 py-3.5 bg-red-600 hover:bg-red-700 text-white rounded-2xl text-[10px] font-black uppercase tracking-widest shadow-xl shadow-red-100">Day End</button>}
+            <div className="flex items-center gap-4">
+              <div className="flex flex-col items-center">
+                <div className={`w-3 h-3 rounded-full mb-1 ${isSyncing ? 'bg-blue-500 animate-ping' : 'bg-emerald-500 shadow-[0_0_8px_rgba(16,185,129,0.8)]'}`}></div>
+                <span className="text-[8px] font-black uppercase text-slate-400">Sync</span>
+              </div>
+              <button onClick={() => setShowHistory(true)} className="px-6 py-3.5 bg-slate-100 hover:bg-slate-200 rounded-2xl text-[10px] font-black uppercase tracking-widest transition-all">Records</button>
+              {isLaptop && <button onClick={doDayEnd} className="px-6 py-3.5 bg-red-600 hover:bg-red-700 text-white rounded-2xl text-[10px] font-black uppercase tracking-widest shadow-xl shadow-red-50">Day End</button>}
             </div>
           </div>
         </div>
@@ -240,42 +250,42 @@ export default function App() {
 
       <main className="flex-1 max-w-[1750px] w-full mx-auto p-4 md:p-10 space-y-10">
         
-        {/* Highlight Totals */}
+        {/* Balanced Highlights */}
         <div className="grid grid-cols-1 md:grid-cols-3 gap-8">
-          <div className="bg-blue-600 rounded-[3rem] p-12 text-white shadow-2xl relative overflow-hidden">
+          <div className="bg-blue-600 rounded-[3rem] p-12 text-white shadow-2xl ring-8 ring-white/50">
             <Label className="text-blue-100">Total Cash In</Label>
-            <div className="text-6xl font-black tracking-tighter">Rs. {(totals.finalIn ?? 0).toLocaleString()}</div>
+            <div className="text-6xl font-black tracking-tighter">Rs. {(totals.finalIn || 0).toLocaleString()}</div>
           </div>
-          <div className="bg-red-600 rounded-[3rem] p-12 text-white shadow-2xl relative overflow-hidden">
+          <div className="bg-red-600 rounded-[3rem] p-12 text-white shadow-2xl ring-8 ring-white/50">
             <Label className="text-red-100">Total Cash Out</Label>
-            <div className="text-6xl font-black tracking-tighter">Rs. {(totals.finalOut ?? 0).toLocaleString()}</div>
+            <div className="text-6xl font-black tracking-tighter">Rs. {(totals.finalOut || 0).toLocaleString()}</div>
           </div>
-          <div className="bg-emerald-600 rounded-[3rem] p-12 text-white shadow-2xl relative overflow-hidden">
+          <div className="bg-emerald-600 rounded-[3rem] p-12 text-white shadow-2xl ring-8 ring-white/50">
             <Label className="text-emerald-100">Final Balance</Label>
-            <div className="text-6xl font-black tracking-tighter">Rs. {(totals.finalBalance ?? 0).toLocaleString()}</div>
+            <div className="text-6xl font-black tracking-tighter">Rs. {(totals.finalBalance || 0).toLocaleString()}</div>
           </div>
         </div>
 
-        {/* Card/PayPal Summaries */}
+        {/* Global Payment Subtotals */}
         <div className="grid grid-cols-1 sm:grid-cols-2 gap-8">
-          <div className="bg-amber-100 border-4 border-amber-200 p-10 rounded-[2.5rem] flex justify-between items-center">
+          <div className="bg-amber-100 border-4 border-amber-200 p-10 rounded-[2.5rem] flex justify-between items-center shadow-inner">
             <span className="text-amber-900 font-black uppercase text-sm tracking-widest">Grand Card Total</span>
-            <span className="text-amber-600 font-black text-5xl">Rs. {(totals.grandCard ?? 0).toLocaleString()}</span>
+            <span className="text-amber-600 font-black text-5xl">Rs. {(totals.grandCard || 0).toLocaleString()}</span>
           </div>
-          <div className="bg-purple-100 border-4 border-purple-200 p-10 rounded-[2.5rem] flex justify-between items-center">
+          <div className="bg-purple-100 border-4 border-purple-200 p-10 rounded-[2.5rem] flex justify-between items-center shadow-inner">
             <span className="text-purple-900 font-black uppercase text-sm tracking-widest">Grand PayPal Total</span>
-            <span className="text-purple-600 font-black text-5xl">Rs. {(totals.grandPaypal ?? 0).toLocaleString()}</span>
+            <span className="text-purple-600 font-black text-5xl">Rs. {(totals.grandPaypal || 0).toLocaleString()}</span>
           </div>
         </div>
 
         <div className="grid grid-cols-1 xl:grid-cols-12 gap-10">
           
-          {/* Out Party List */}
+          {/* Out Party Area */}
           <div className="xl:col-span-4">
             <Section title="Out Party Section" isLaptop={isLaptop}>
               <div className="space-y-4 max-h-[600px] overflow-y-auto no-scrollbar pr-2">
                 {(state.outPartyEntries || []).map((e) => (
-                  <div key={e.id} className="group bg-slate-50 border-2 border-slate-100 rounded-2xl p-6 flex items-center gap-6 hover:border-blue-400 transition-all">
+                  <div key={e.id} className="group bg-slate-50 border-2 border-slate-100 rounded-2xl p-6 flex items-center gap-6 hover:border-blue-500 transition-all">
                     <div className="w-12 h-12 bg-black text-white rounded-xl flex items-center justify-center text-sm font-black shadow-lg">{e.index}</div>
                     <div className="flex-1 space-y-2">
                       <div className="flex items-center gap-2">
@@ -310,18 +320,18 @@ export default function App() {
               </div>
               {isLaptop && (
                 <button onClick={addOP} className="w-full mt-8 py-5 border-2 border-dashed border-slate-300 rounded-3xl text-slate-400 font-black text-[11px] uppercase tracking-[0.4em] hover:bg-white hover:border-blue-500 hover:text-blue-500 transition-all">
-                   Add Out Party Entry
+                   New Out Party Entry
                 </button>
               )}
               <div className="mt-10 pt-10 border-t-2 border-slate-100 space-y-6">
-                <div className="flex justify-between items-center"><Label className="m-0">OP Cash Total</Label><span className="text-blue-700 font-black text-xl">Rs. {(totals.op.cash ?? 0).toLocaleString()}</span></div>
-                <div className="flex justify-between items-center"><Label className="m-0">OP Card Total</Label><span className="text-amber-600 font-black text-xl">Rs. {(totals.op.card ?? 0).toLocaleString()}</span></div>
-                <div className="flex justify-between items-center"><Label className="m-0">OP PayPal Total</Label><span className="text-purple-700 font-black text-xl">Rs. {(totals.op.paypal ?? 0).toLocaleString()}</span></div>
+                <div className="flex justify-between items-center"><Label className="m-0">OP Cash</Label><span className="text-blue-700 font-black text-xl">Rs. {(totals.op.cash || 0).toLocaleString()}</span></div>
+                <div className="flex justify-between items-center"><Label className="m-0">OP Card</Label><span className="text-amber-600 font-black text-xl">Rs. {(totals.op.card || 0).toLocaleString()}</span></div>
+                <div className="flex justify-between items-center"><Label className="m-0">OP PayPal</Label><span className="text-purple-700 font-black text-xl">Rs. {(totals.op.paypal || 0).toLocaleString()}</span></div>
               </div>
             </Section>
           </div>
 
-          {/* Main Section Dashboard */}
+          {/* Main Log Area */}
           <div className="xl:col-span-8">
             <Section title="Main Section Dashboard" isLaptop={isLaptop}>
               <div className="overflow-x-auto no-scrollbar">
@@ -331,8 +341,8 @@ export default function App() {
                       <th className="px-6 py-2">Room</th>
                       <th className="px-6 py-2 min-w-[350px]">Description</th>
                       <th className="px-6 py-2 text-center">Method</th>
-                      <th className="px-6 py-2 text-right">Cash In</th>
-                      <th className="px-6 py-2 text-right">Cash Out</th>
+                      <th className="px-6 py-2 text-right">In</th>
+                      <th className="px-6 py-2 text-right">Out</th>
                       {isLaptop && <th className="px-6 py-2 w-10"></th>}
                     </tr>
                   </thead>
@@ -377,7 +387,7 @@ export default function App() {
               </div>
               {isLaptop && (
                 <button onClick={addM} className="w-full mt-10 py-7 bg-black text-white rounded-[2.5rem] font-black text-[12px] uppercase tracking-[0.5em] shadow-2xl hover:scale-[1.01] transition-all">
-                  Add New Entry to Main Log
+                  Add New Main Section Entry
                 </button>
               )}
             </Section>
@@ -388,10 +398,10 @@ export default function App() {
       <footer className="bg-slate-900 px-8 py-6 text-slate-500 border-t border-slate-800">
         <div className="max-w-[1750px] mx-auto flex justify-between items-center">
           <div className="flex items-center gap-4">
-            <div className={`w-3 h-3 rounded-full animate-pulse shadow-lg ${isLaptop ? 'bg-emerald-500' : 'bg-blue-400'}`}></div>
-            <span className="text-[11px] font-black uppercase tracking-[0.5em]">Sync Status: {device.toUpperCase()} CLOUD LINK SECURED</span>
+            <div className={`w-3 h-3 rounded-full ${isLaptop ? 'bg-emerald-500' : 'bg-blue-400 shadow-[0_0_10px_rgba(96,165,250,0.8)]'}`}></div>
+            <span className="text-[11px] font-black uppercase tracking-[0.5em]">Mode: {device.toUpperCase()} • Connection: RELAY ACTIVE</span>
           </div>
-          <div className="text-[10px] font-black uppercase tracking-widest italic opacity-30">Shivas Beach Cabanas Financial Suite v6.0 • Cross-Network Live Sync</div>
+          <div className="text-[10px] font-black uppercase tracking-widest italic opacity-30">Shivas Beach Cabanas Financial Suite v7.0 • Instant Cloud Relay</div>
         </div>
       </footer>
 
@@ -399,7 +409,7 @@ export default function App() {
         <div className="fixed inset-0 z-[100] bg-black/95 backdrop-blur-2xl flex items-center justify-center p-4">
           <div className="bg-white w-full max-w-6xl rounded-[4rem] shadow-2xl flex flex-col max-h-[85vh] overflow-hidden">
             <div className="bg-slate-100 p-10 flex justify-between items-center border-b border-slate-200">
-              <h3 className="text-3xl font-black text-black uppercase tracking-widest">Financial Archives</h3>
+              <h3 className="text-3xl font-black text-black uppercase tracking-widest">Financial Records History</h3>
               <button onClick={() => setShowHistory(false)} className="p-4 hover:bg-white rounded-full transition-all text-slate-400 hover:text-black">
                 <svg className="w-10 h-10" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="3" d="M6 18L18 6M6 6l12 12" /></svg>
               </button>
@@ -411,7 +421,7 @@ export default function App() {
                 history.map((h, i) => (
                   <div key={i} className="p-12 bg-slate-50 rounded-[3.5rem] border-2 border-slate-100 hover:border-blue-500 transition-all flex justify-between items-end">
                     <div><Label>Archive Date</Label><div className="text-4xl font-black">{h.date}</div></div>
-                    <div className="text-right"><Label>Closing Balance</Label><div className="text-4xl font-black text-emerald-700">Rs. {(h.data?.openingBalance ?? 0).toLocaleString()}</div></div>
+                    <div className="text-right"><Label>Closing Balance</Label><div className="text-4xl font-black text-emerald-700">Rs. {(h.data?.openingBalance || 0).toLocaleString()}</div></div>
                   </div>
                 ))
               )}

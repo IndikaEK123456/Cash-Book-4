@@ -1,60 +1,57 @@
 
-import { SyncData, CashBookState } from '../types';
+import { CashBookState } from '../types';
 
 /**
- * SHIVAS CLOUD RELAY SERVICE
- * Uses a public, CORS-enabled JSON store for true cross-device synchronization.
+ * SHIVAS LIVE CLOUD RELAY (JSONBLOB)
+ * This service allows Laptop and Mobile to share a single source of truth.
  */
 
-const PANTRY_ID = '9416809c-3430-4e33-9115-46f059f1f008'; // Shared unique pantry ID
-const BASKET_NAME = 'shivas_beach_sync';
-const CLOUD_URL = `https://getpantry.cloud/apiv1/pantry/${PANTRY_ID}/basket/${BASKET_NAME}`;
+// Stable ID for Shivas Beach Cabanas
+const BLOB_ID = '1344265780516626432'; 
+const CLOUD_URL = `https://jsonblob.com/api/jsonBlob/${BLOB_ID}`;
 
 const STORAGE_KEY = 'shivas_local_cache';
 const HISTORY_KEY = 'shivas_history';
 
-export const saveState = async (state: CashBookState) => {
-  if (!state) return;
+export const saveState = async (state: CashBookState): Promise<boolean> => {
+  if (!state) return false;
   
-  const data: SyncData = {
-    state,
-    updatedAt: Date.now(),
-  };
+  // Save locally first
+  localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
 
-  // 1. Update Local Cache
-  localStorage.setItem(STORAGE_KEY, JSON.stringify(data));
-
-  // 2. Push to Cloud (Laptop only sends)
   try {
-    await fetch(CLOUD_URL, {
-      method: 'POST',
+    const response = await fetch(CLOUD_URL, {
+      method: 'PUT',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(data.state), // Pantry stores the object directly
+      body: JSON.stringify(state),
     });
+    return response.ok;
   } catch (e) {
     console.error("Cloud Push Failed:", e);
+    return false;
   }
 };
 
 export const getState = async (): Promise<CashBookState | null> => {
   try {
-    const response = await fetch(CLOUD_URL);
+    const response = await fetch(CLOUD_URL, {
+      method: 'GET',
+      headers: { 'Accept': 'application/json' }
+    });
     if (response.ok) {
-      const cloudState: any = await response.json();
-      // Basic validation to ensure it looks like our state
-      if (cloudState && (cloudState.outPartyEntries || cloudState.mainEntries)) {
-        return cloudState as CashBookState;
+      const data = await response.json();
+      if (data && (data.outPartyEntries || data.mainEntries)) {
+        return data as CashBookState;
       }
     }
   } catch (e) {
-    console.warn("Cloud Sync Unavailable - Checking Local Cache");
+    console.warn("Cloud Sync Unavailable");
   }
 
   const local = localStorage.getItem(STORAGE_KEY);
   if (!local) return null;
   try {
-    const parsed = JSON.parse(local);
-    return parsed.state || null;
+    return JSON.parse(local);
   } catch (e) {
     return null;
   }
